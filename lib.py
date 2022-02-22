@@ -75,15 +75,19 @@ class field(object):
         return
 
     @classmethod
-    def from_file(cls, l, fname, top="/", pick=None, metadata=False):
+    def from_file(cls, l, fname, top="/", pick=None, metadata=False, metadata_only=False):
         comm = l.comm
-        if metadata:
+        if metadata or metadata_only:
             m = list()
         with h5py.File(fname, "r", driver='mpio', comm=comm) as fp:
             Ly,Lx = l.L
             if pick is None:
                 pick = slice(0, None)
             trajs = list(fp[f"{top}/"])[pick]
+            if metadata_only:
+                for i,tr in enumerate(trajs):
+                    m.append(dict(fp[f"{top}/{tr}"].attrs))
+                return m
             ly, lx = l.lL
             ry, rx = l.pcoords
             sx = slice(lx*rx, lx*(rx+1))
@@ -123,7 +127,7 @@ class gauge(field):
         self.data = self.data ** 0
         return
     
-    def xchange(self):
+    def _xchange(self):
         ly,lx = self.lat.lL
         u0 = np.array(self.data.reshape([self.N,ly+2,lx+2,self.ndof]))
         npy,npx = self.lat.procs
@@ -141,6 +145,31 @@ class gauge(field):
         comm.Sendrecv(u2[lx, :, :, :], r0p, sendtag=r0p, recvbuf=u2[   0, :, :, :], source=r0m, recvtag=rank)
         comm.Sendrecv(u2[ 1, :, :, :], r0m, sendtag=r0m, recvbuf=u2[lx+1, :, :, :], source=r0p, recvtag=rank)
         self.data[:,:,:] = np.array(u2[:,:,:,:].transpose((2, 1, 0, 3)).reshape([self.N, (ly+2)*(lx+2), self.ndof]), order="C")
+        return
+
+    def xchange(self):
+        ly,lx = self.lat.lL
+        u0 = np.array(self.data.reshape([self.N,ly+2,lx+2,self.ndof]))
+        npy,npx = self.lat.procs
+        rky,rkx = self.lat.pcoords
+        comm = self.lat.comm
+        rank = self.lat.rank
+        rp0 = rkx + ((npy+rky+1)%npy)*npx
+        rm0 = rkx + ((npy+rky-1)%npy)*npx
+        r0p = (npx+rkx+1)%npx + rky*npx
+        r0m = (npx+rkx-1)%npx + rky*npx
+        # u1 = np.array(u0.transpose(1, 0, 2, 3), order="C") ### n, y, x, mu -> y, n, x, mu
+        # comm.Sendrecv(u1[ly, :, :, :], rp0, sendtag=rp0, recvbuf=u1[   0, :, :, :], source=rm0, recvtag=rank)
+        # comm.Sendrecv(u1[ 1, :, :, :], rm0, sendtag=rm0, recvbuf=u1[ly+1, :, :, :], source=rp0, recvtag=rank)
+        # u2 = np.array(u1.transpose(2, 0, 1, 3), order="C") ### y, n, x, mu -> x, y, n, mu
+        # comm.Sendrecv(u2[lx, :, :, :], r0p, sendtag=r0p, recvbuf=u2[   0, :, :, :], source=r0m, recvtag=rank)
+        # comm.Sendrecv(u2[ 1, :, :, :], r0m, sendtag=r0m, recvbuf=u2[lx+1, :, :, :], source=r0p, recvtag=rank)
+        # self.data[:,:,:] = np.array(u2[:,:,:,:].transpose((2, 1, 0, 3)).reshape([self.N, (ly+2)*(lx+2), self.ndof]), order="C")
+        u0[:,   0,   :, :] = comm.sendrecv(u0[:,ly, ...], rp0, sendtag=rp0, source=rm0, recvtag=rank)
+        u0[:,ly+1,   :, :] = comm.sendrecv(u0[:, 1, ...], rm0, sendtag=rm0, source=rp0, recvtag=rank)
+        u0[:,   :,   0, :] = comm.sendrecv(u0[:, :,lx,:], r0p, sendtag=r0p, source=r0m, recvtag=rank)
+        u0[:,   :,lx+1, :] = comm.sendrecv(u0[:, :, 1,:], r0m, sendtag=r0m, source=r0p, recvtag=rank)
+        self.data[:,:,:] = np.array(u0[:,:,:,:].reshape([self.N, (ly+2)*(lx+2), self.ndof]), order="C")
         return
     
     def hot(self, seed=None):
@@ -220,7 +249,7 @@ class gauge(field):
 
     def apesmear(self, alpha):
         self.xchange()
-        ly,Lx = self.lat.L
+        Ly,Lx = self.lat.L
         ly,lx = self.lat.lL
         x = self.lat.idx
         u = np.zeros([self.N,(ly+2)*(lx+2),self.ndof], complex)
@@ -239,9 +268,8 @@ class gauge(field):
             f1 = u1*u2*u3
             #.
             u0 = self.data[:,x[0],mu]
-            u[:, x[0], mu] = (1-alpha)*u0 + alpha*(f0 + f1)
-
-        u[:, x[0], :] = u[:, x[0], :]/np.sqrt((u[:, x[0], :]*u[:, x[0], :].conj()).real)
+            u0 = (1-alpha)*u0 + alpha*(f0 + f1)
+            u[:, x[0], mu] = u0/np.sqrt((u0.conj()*u0).real)
         self.data = np.array(u, order="C")
         return
     
